@@ -37,8 +37,34 @@ EOF
 launchctl bootout gui/$(id -u)/com.dts.dictation-pause 2>/dev/null || true
 launchctl bootstrap gui/$(id -u) "$PLIST"
 
+# Doctor: health check + auto-repair + notification on human-action problems.
+DOCTOR_PLIST="$HOME/Library/LaunchAgents/com.dts.dictation-pause-doctor.plist"
+cat > "$DOCTOR_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.dts.dictation-pause-doctor</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>$REPO_DIR/doctor.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>43200</integer>
+</dict>
+</plist>
+EOF
+launchctl bootout gui/$(id -u)/com.dts.dictation-pause-doctor 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) "$DOCTOR_PLIST"
+
 echo
 echo "installed and started (RunAtLoad + KeepAlive: launches on every login, restarts if it dies)"
+echo "doctor: health check + auto-repair runs at login and every 12 h; posts a macOS notification if something needs you"
+echo "manual check: $REPO_DIR/doctor.sh"
 echo "log:  tail -f /tmp/dictation-pause.log"
 echo
 echo "If the log shows 'WARNING: Accessibility not granted', grant it once:"

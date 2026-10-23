@@ -39,6 +39,19 @@ If the log shows `WARNING: Accessibility not granted`, grant it once:
 changes, so macOS requires re-granting Accessibility — remove the old entry
 and re-add. (Only needed on rebuilds, not reboots.)
 
+## Self-healing (doctor)
+
+`install.sh` also registers a second LaunchAgent
+(`com.dts.dictation-pause-doctor`) that runs `doctor.sh` at login and every
+12 hours. It auto-repairs what's safe — rebuilds a missing binary,
+re-bootstraps a dropped agent — and posts a **macOS notification** when
+something needs a human (Accessibility grant reset by an update, or no
+detection activity in 21+ days, which usually means a macOS update changed
+the dictation signal). The notification points at this README and the GitHub
+repo, so nothing has to be remembered.
+
+Run a manual check any time: `~/dev/dictation-pause/doctor.sh`
+
 ## Manage
 
 ```bash
