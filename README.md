@@ -1,5 +1,7 @@
 # dictation-pause
 
+![dictation-pause banner](assets/banner.jpg)
+
 Pauses media playback while you're dictating on macOS, and resumes it when
 you stop (Whisperflow-style). Scope: microphone activity — video calls also
 pause playback (see "Known limitations").
