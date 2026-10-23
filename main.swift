@@ -1,6 +1,12 @@
-// dictation-pause — pauses media while macOS built-in dictation is active,
-// and resumes it when dictation ends. Event-driven: CoreAudio listeners only,
-// no polling, no spawned processes.
+// dictation-pause v2 — pauses media playback while the system microphone
+// indicator is up, and resumes when it clears.
+//
+// Why window polling instead of CoreAudio device watching: on recent macOS,
+// dictation captures the mic through a path that never raises the input
+// device's IsRunningSomewhere flag (verified empirically — see
+// diagnostics/). The system mic indicator windows (owner "Window Server",
+// name "StatusIndicator") ARE raised for microphone activity, so we poll
+// CGWindowList at 2 Hz (~0.1% CPU).
 
 import AppKit
 import ApplicationServices
@@ -12,17 +18,17 @@ import Dispatch
 
 let logPath = "/tmp/dictation-pause.log"
 let maxLogBytes = 100_000
+let pollInterval = 0.25
+let downConfirmSamples = 2 // indicator must be gone ~0.5 s before we resume
 
-// After mic activation: two output-activity samples, 0.35 s apart. Pause fires
-// only if BOTH sample "running" — the gap skips the short dictation start
-// beep, so a merely *paused* video can never be toggled back ON.
-let sample1Delay = 0.35
+// Fast path: if the output device was rendering audio shortly BEFORE mic
+// activity started, that evidence is trustworthy (the dictation start beep
+// hasn't happened yet), so pause immediately. Fallback: two output samples
+// after the start, 0.4 s apart — this skips the start beep and ensures a
+// merely *paused* tab (no audio stream) is never toggled back ON.
+let instantPauseRecency = 1.5
+let sample1Delay = 0.4
 let sample2Delay = 0.25
-
-// Process-name fragments (lowercase) that indicate macOS dictation owns the mic.
-let dictationFragments = ["speechrecogn", "dictation"]
-// Fragments logged for tuning when the mic activates without a dictation match.
-let diagnosticFragments = ["speech", "dictat", "recogn", "siri", "assistant", "voice", "keyboard"]
 
 // MARK: - Logging
 
@@ -67,20 +73,25 @@ func postMediaKeyToggle() {
     log("media-key toggle posted")
 }
 
-// MARK: - CoreAudio helpers
+// MARK: - Mic indicator (the dictation/mic-activity signal)
 
-let systemObject = AudioObjectID(kAudioObjectSystemObject)
-
-func propertyAddress(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
-    AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
-                               mElement: kAudioObjectPropertyElementMain)
+func micIndicatorUp() -> Bool {
+    guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return false }
+    return list.contains {
+        ($0[kCGWindowOwnerName as String] as? String) == "Window Server"
+            && ($0[kCGWindowName as String] as? String) == "StatusIndicator"
+    }
 }
 
-func defaultDeviceID(_ selector: AudioObjectPropertySelector) -> AudioObjectID {
+// MARK: - Output audio state
+
+func defaultOutputDeviceID() -> AudioObjectID {
     var device = AudioObjectID(0)
     var size = UInt32(MemoryLayout<AudioObjectID>.size)
-    var addr = propertyAddress(selector)
-    guard AudioObjectGetPropertyData(systemObject, &addr, 0, nil, &size, &device) == noErr else { return 0 }
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &device) == noErr else { return 0 }
     return device
 }
 
@@ -88,159 +99,90 @@ func deviceIsRunningSomewhere(_ device: AudioObjectID) -> Bool {
     guard device != 0 else { return false }
     var running: UInt32 = 0
     var size = UInt32(MemoryLayout<UInt32>.size)
-    var addr = propertyAddress(kAudioDevicePropertyDeviceIsRunningSomewhere)
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
     guard AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &running) == noErr else { return false }
     return running != 0
 }
 
-// MARK: - Process gate
+// MARK: - State machine (main queue only)
 
-func runningProcessNames() -> [String] {
-    let count = Int(proc_listallpids(nil, 0))
-    guard count > 0 else { return [] }
-    var pids = [pid_t](repeating: 0, count: count + 64) // slack for processes spawning meanwhile
-    let written = proc_listallpids(&pids, Int32(pids.count))
-    guard written > 0 else { return [] }
-    var names = Set<String>()
-    for pid in pids.prefix(Int(written)) where pid > 0 {
-        var path = [CChar](repeating: 0, count: 4096)
-        if proc_pidpath(pid, &path, UInt32(path.count)) > 0 {
-            names.insert(String(cString: path).split(separator: "/").last.map(String.init) ?? "")
-        } else {
-            var name = [CChar](repeating: 0, count: 64)
-            if proc_name(pid, &name, UInt32(name.count)) > 0 {
-                names.insert(String(cString: name))
-            }
-        }
-    }
-    return names.filter { !$0.isEmpty }.sorted()
-}
-
-func isDictationProcessPresent() -> Bool {
-    let names = runningProcessNames()
-    let pairs = names.map { ($0, $0.lowercased()) }
-    let matches = pairs.filter { _, lo in dictationFragments.contains { lo.contains($0) } }.map { $0.0 }
-    if !matches.isEmpty {
-        log("dictation process present: \(matches.joined(separator: ", "))")
-        return true
-    }
-    let interesting = pairs
-        .filter { _, lo in diagnosticFragments.contains { lo.contains($0) } }
-        .map { $0.0 }
-    log("no dictation process; mic likely belongs to another app (speech-ish: [\(interesting.joined(separator: ", "))])")
-    return false
-}
-
-// MARK: - State machine (all state touched on the main queue only)
-
-var watchedInput = AudioObjectID(0)
-var micRunningObserved = false
+var micActiveObserved = false
+var downStreak = 0
 var pausedByUs = false
 var cycleID = 0
-
-let listenerQueue = DispatchQueue(label: "com.dts.dictation-pause.audio")
-
-func handleMicStateChange() {
-    let running = deviceIsRunningSomewhere(watchedInput)
-    guard running != micRunningObserved else { return }
-    micRunningObserved = running
-    cycleID += 1 // invalidate any in-flight pause decision
-    if running {
-        log("mic: ACTIVE")
-        schedulePauseDecision()
-    } else {
-        log("mic: idle")
-        if pausedByUs {
-            pausedByUs = false
-            log("dictation ended → resuming playback")
-            postMediaKeyToggle()
-        }
-    }
-}
+var lastPlayingAt = Date.distantPast
 
 func schedulePauseDecision() {
     cycleID += 1
     let id = cycleID
     DispatchQueue.main.asyncAfter(deadline: .now() + sample1Delay) {
-        guard id == cycleID, micRunningObserved else { return }
-        guard isDictationProcessPresent() else { return }
-        let first = deviceIsRunningSomewhere(defaultDeviceID(kAudioHardwarePropertyDefaultOutputDevice))
+        guard id == cycleID, micActiveObserved else { return }
+        let first = deviceIsRunningSomewhere(defaultOutputDeviceID())
         DispatchQueue.main.asyncAfter(deadline: .now() + sample2Delay) {
-            guard id == cycleID, micRunningObserved else { return }
-            let second = deviceIsRunningSomewhere(defaultDeviceID(kAudioHardwarePropertyDefaultOutputDevice))
+            guard id == cycleID, micActiveObserved else { return }
+            let second = deviceIsRunningSomewhere(defaultOutputDeviceID())
             if first && second {
                 if !pausedByUs {
                     pausedByUs = true
-                    log("dictation active + audio playing → pausing")
+                    log("mic active + audio streaming → pausing")
                     postMediaKeyToggle()
                 }
             } else {
-                log("output idle → nothing to pause")
+                log("mic active but no audio stream → nothing to pause")
             }
         }
     }
 }
 
-// Watchdog: CoreAudio change-notifications can silently stop being delivered
-// (e.g. if coreaudiod restarts). A cheap 5 s property read re-syncs state, so
-// a missed edge is recovered and logged instead of silently ignored.
-func reconcileWithWatchdog() {
-    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { reconcileWithWatchdog() }
-    guard watchedInput != 0 else { return }
-    let running = deviceIsRunningSomewhere(watchedInput)
-    guard running != micRunningObserved else { return }
-    log("watchdog: mic \(running ? "ACTIVE" : "idle") missed by listener — recovering")
-    handleMicStateChange()
-}
-
-// MARK: - Device watching
-
-var inputListenerBlock: AudioObjectPropertyListenerBlock?
-
-func watch(inputDevice: AudioObjectID) {
-    if watchedInput != 0, let block = inputListenerBlock {
-        var addr = propertyAddress(kAudioDevicePropertyDeviceIsRunningSomewhere)
-        AudioObjectRemovePropertyListenerBlock(watchedInput, &addr, listenerQueue, block)
+func pollTick() {
+    DispatchQueue.main.asyncAfter(deadline: .now() + pollInterval) { pollTick() }
+    if deviceIsRunningSomewhere(defaultOutputDeviceID()) {
+        lastPlayingAt = Date()
     }
-    watchedInput = inputDevice
-    guard inputDevice != 0 else {
-        log("no default input device; waiting for one")
-        return
-    }
-    let block: AudioObjectPropertyListenerBlock = { _, _ in
-        DispatchQueue.main.async { handleMicStateChange() }
-    }
-    inputListenerBlock = block
-    var addr = propertyAddress(kAudioDevicePropertyDeviceIsRunningSomewhere)
-    let status = AudioObjectAddPropertyListenerBlock(inputDevice, &addr, listenerQueue, block)
-    log("watching input device \(inputDevice) (status \(status))")
-}
-
-let defaultInputChanged: AudioObjectPropertyListenerBlock = { _, _ in
-    DispatchQueue.main.async {
-        let device = defaultDeviceID(kAudioHardwarePropertyDefaultInputDevice)
-        log("default input changed → device \(device)")
-        watch(inputDevice: device)
-        micRunningObserved = deviceIsRunningSomewhere(device) // resync without acting on an edge
-        cycleID += 1
+    let up = micIndicatorUp()
+    if up != micActiveObserved {
+        if up {
+            micActiveObserved = true
+            downStreak = 0
+            log("mic indicator UP")
+            if Date().timeIntervalSince(lastPlayingAt) < instantPauseRecency {
+                if !pausedByUs {
+                    pausedByUs = true
+                    log("audio was playing just before mic activity → pausing now")
+                    postMediaKeyToggle()
+                }
+            } else {
+                schedulePauseDecision()
+            }
+        } else {
+            downStreak += 1
+            if downStreak >= downConfirmSamples {
+                micActiveObserved = false
+                downStreak = 0
+                cycleID += 1 // cancel any in-flight pause decision
+                log("mic indicator down")
+                if pausedByUs {
+                    pausedByUs = false
+                    log("→ resuming playback")
+                    postMediaKeyToggle()
+                }
+            }
+        }
+    } else if !up {
+        downStreak = 0
     }
 }
 
 // MARK: - Main
 
-log("--- dictation-pause starting (pid \(getpid())) ---")
+log("--- dictation-pause v2 starting (pid \(getpid())) ---")
 if AXIsProcessTrusted() {
     log("accessibility: trusted")
 } else {
     log("WARNING: Accessibility not granted — media-key events will be dropped by the system")
 }
-
-var sysAddr = propertyAddress(kAudioHardwarePropertyDefaultInputDevice)
-AudioObjectAddPropertyListenerBlock(systemObject, &sysAddr, listenerQueue, defaultInputChanged)
-
-watch(inputDevice: defaultDeviceID(kAudioHardwarePropertyDefaultInputDevice))
-micRunningObserved = deviceIsRunningSomewhere(watchedInput)
-log("initial mic state: \(micRunningObserved ? "active" : "idle"); acting on changes only")
-reconcileWithWatchdog()
-
+log("polling system mic indicator every \(pollInterval)s")
+pollTick()
 dispatchMain()
