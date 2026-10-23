@@ -15,8 +15,8 @@ A single compiled Swift binary (~10–15 MB RSS) runs as a LaunchAgent:
    Note: watching audio *devices* does NOT work for dictation — macOS
    captures dictation audio through a path that never sets the input
    device's IsRunningSomewhere flag.
-2. **Fast path**: if the output device was rendering audio shortly before
-   mic activity started (trustworthy pre-beep evidence), pause immediately.
+2. **Fast path**: if the output device was rendering audio across the two
+   most recent polls (≈0.5 s) before mic activity started, pause immediately.
 3. **Fallback**: two output samples 0.4 s apart (skips the dictation start
    beep) so a merely *paused* tab is never toggled back ON.
 4. Pause/resume is the NX_KEYTYPE_PLAY media event — byte-identical to the
@@ -66,6 +66,11 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dts.dictation-pause.
   (calls, voice memos) pauses playback. Detecting *dictation specifically*
   proved unreliable (the speech-daemon process churn is uncorrelated; the
   mic indicator is the only public signal).
+- If you pause a video and dictate within ~30 seconds, the video may resume:
+  Chromium keeps the paused tab's audio stream open briefly, and at the
+  device level "paused but stream open" is indistinguishable from playing.
+  The device flag goes idle once the stream closes, which is what the
+  stable-playback check requires.
 - Media-key events pause one app at a time (macOS media-session routing).
 
 ## Files

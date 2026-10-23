@@ -21,14 +21,15 @@ let maxLogBytes = 100_000
 let pollInterval = 0.25
 let downConfirmSamples = 2 // indicator must be gone ~0.5 s before we resume
 
-// Fast path: if the output device was rendering audio shortly BEFORE mic
-// activity started, that evidence is trustworthy (the dictation start beep
-// hasn't happened yet), so pause immediately. Fallback: two output samples
-// after the start, 0.4 s apart — this skips the start beep and ensures a
-// merely *paused* tab (no audio stream) is never toggled back ON.
-let instantPauseRecency = 1.5
-let sample1Delay = 0.4
-let sample2Delay = 0.25
+// Pause ONLY on stable pre-dictation playback: the output device must have
+// been rendering continuously for the last few polls. Chromium keeps a
+// paused tab's audio stream open (rendering silence) for a while, so a tab
+// paused moments before dictating can still read "running" — an unavoidable
+// limitation without per-app audio metering. There is deliberately NO
+// post-start sampling: a wrong toggle here RESUMES a paused tab (worse than
+// missing a pause), and post-start samples can't be trusted (start beep,
+// lingering streams).
+let stablePlaybackTicks = 2
 
 // MARK: - Logging
 
@@ -111,35 +112,15 @@ func deviceIsRunningSomewhere(_ device: AudioObjectID) -> Bool {
 var micActiveObserved = false
 var downStreak = 0
 var pausedByUs = false
-var cycleID = 0
-var lastPlayingAt = Date.distantPast
-
-func schedulePauseDecision() {
-    cycleID += 1
-    let id = cycleID
-    DispatchQueue.main.asyncAfter(deadline: .now() + sample1Delay) {
-        guard id == cycleID, micActiveObserved else { return }
-        let first = deviceIsRunningSomewhere(defaultOutputDeviceID())
-        DispatchQueue.main.asyncAfter(deadline: .now() + sample2Delay) {
-            guard id == cycleID, micActiveObserved else { return }
-            let second = deviceIsRunningSomewhere(defaultOutputDeviceID())
-            if first && second {
-                if !pausedByUs {
-                    pausedByUs = true
-                    log("mic active + audio streaming → pausing")
-                    postMediaKeyToggle()
-                }
-            } else {
-                log("mic active but no audio stream → nothing to pause")
-            }
-        }
-    }
-}
+var consecutiveRunning = 0
 
 func pollTick() {
     DispatchQueue.main.asyncAfter(deadline: .now() + pollInterval) { pollTick() }
-    if deviceIsRunningSomewhere(defaultOutputDeviceID()) {
-        lastPlayingAt = Date()
+    let running = deviceIsRunningSomewhere(defaultOutputDeviceID())
+    if running {
+        consecutiveRunning += 1
+    } else {
+        consecutiveRunning = 0
     }
     let up = micIndicatorUp()
     if up != micActiveObserved {
@@ -147,21 +128,20 @@ func pollTick() {
             micActiveObserved = true
             downStreak = 0
             log("mic indicator UP")
-            if Date().timeIntervalSince(lastPlayingAt) < instantPauseRecency {
+            if consecutiveRunning >= stablePlaybackTicks {
                 if !pausedByUs {
                     pausedByUs = true
-                    log("audio was playing just before mic activity → pausing now")
+                    log("playback confirmed stable → pausing now")
                     postMediaKeyToggle()
                 }
             } else {
-                schedulePauseDecision()
+                log("no stable playback before mic activity → not pausing")
             }
         } else {
             downStreak += 1
             if downStreak >= downConfirmSamples {
                 micActiveObserved = false
                 downStreak = 0
-                cycleID += 1 // cancel any in-flight pause decision
                 log("mic indicator down")
                 if pausedByUs {
                     pausedByUs = false
